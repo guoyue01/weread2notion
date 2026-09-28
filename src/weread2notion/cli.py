@@ -6,6 +6,7 @@ import time
 from notion_client import Client
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -39,6 +40,18 @@ WEREAD_SKILL_VERSION = "1.0.4"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
+# 这些微信读书字段会作为 Notion 数据库属性同步。
+SYNC_PROPERTY_TYPES = {
+    "字数": "number",
+    "译者": "rich_text",
+    "最后阅读时间": "date",
+    "累计阅读时长": "rich_text",
+    "读完时间": "date",
+    "是否已经开始阅读": "checkbox",
+    "划线数": "number",
+    "想法/点评数": "number",
+    "书签数": "number",
+}
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -208,7 +221,10 @@ def get_read_info(bookId):
         "markedStatus": marked_status,
         "readingTime": book.get("recordReadingTime") or 0,
         "readingProgress": reading_progress,
+        # 微信读书返回 Unix 时间戳，写入 Notion 前统一转为东八区时间。
         "finishedDate": finish_time,
+        "lastReadDate": update_time,
+        "isStartReading": bool(book.get("isStartReading")),
     }
 
 
@@ -232,9 +248,13 @@ def normalize_rating(value):
 def get_bookinfo(bookId):
     """获取书的详情"""
     data = weread.request("/book/info", bookId=bookId)
-    isbn = data.get("isbn", "")
-    newRating = normalize_rating(data.get("newRating"))
-    return (isbn, newRating)
+    # 只返回需要写入 Notion 的书籍详情字段。
+    return {
+        "isbn": data.get("isbn", ""),
+        "rating": normalize_rating(data.get("newRating")),
+        "wordCount": data.get("wordCount"),
+        "translator": data.get("translator", ""),
+    }
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
@@ -286,7 +306,16 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
+def insert_to_notion(
+    bookName,
+    bookId,
+    cover,
+    sort,
+    author,
+    book_info,
+    categories,
+    notebook_stats,
+):
     """插入到notion"""
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
@@ -294,17 +323,33 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
-        "ISBN": isbn,
+        "ISBN": book_info.get("isbn", ""),
         "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
         "作者": author,
         "Sort": sort,
-        "评分": rating,
+        "评分": book_info.get("rating"),
+        "字数": book_info.get("wordCount"),
+        "译者": book_info.get("translator", ""),
+        "划线数": notebook_stats.get("noteCount"),
+        "想法/点评数": notebook_stats.get("reviewCount"),
+        "书签数": notebook_stats.get("bookmarkCount"),
     }
     if categories != None:
         raw_properties["分类"] = categories
     read_info = (
         get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
+        if has_any_property(
+            (
+                "状态",
+                "阅读时长",
+                "阅读进度",
+                "时间",
+                "最后阅读时间",
+                "累计阅读时长",
+                "读完时间",
+                "是否已经开始阅读",
+            )
+        )
         else None
     )
     if read_info != None:
@@ -320,13 +365,17 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
             format_time += f"{minutes}分"
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读时长"] = format_time
+        raw_properties["累计阅读时长"] = format_time
         raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        raw_properties["是否已经开始阅读"] = read_info.get("isStartReading", False)
+        # 只写入有效时间，避免空时间戳在 Notion 中显示为 1970 年。
+        if read_info.get("finishedDate"):
+            # 兼容旧模板的“时间”，同时写入新增的“读完时间”。
+            if get_property_type("时间"):
+                raw_properties["时间"] = read_info["finishedDate"]
+            raw_properties["读完时间"] = read_info["finishedDate"]
+        if read_info.get("lastReadDate"):
+            raw_properties["最后阅读时间"] = read_info["lastReadDate"]
 
     properties = build_notion_properties(raw_properties)
     icon = get_icon(cover)
@@ -620,6 +669,38 @@ def load_data_source_schema():
     )
 
 
+def ensure_sync_properties():
+    """自动补充同步属性，并阻止同名的错误类型继续同步。"""
+    invalid = [
+        name
+        for name, expected_type in SYNC_PROPERTY_TYPES.items()
+        if get_property_type(name) not in {None, expected_type}
+    ]
+    if invalid:
+        raise Exception(
+            f"Notion 属性 {', '.join(invalid)} 的类型不正确，请修改或删除后重试"
+        )
+
+    missing = [
+        name for name in SYNC_PROPERTY_TYPES if not get_property_type(name)
+    ]
+    if not missing:
+        return
+
+    # Notion Data Source API 使用空配置对象创建对应类型的属性。
+    client.request(
+        path=f"data_sources/{data_source_id}",
+        method="PATCH",
+        body={
+            "properties": {
+                name: {SYNC_PROPERTY_TYPES[name]: {}} for name in missing
+            }
+        },
+    )
+    print(f"已在 Notion 创建同步属性: {', '.join(missing)}")
+    load_data_source_schema()
+
+
 def get_property_type(name):
     return data_source_property_types.get(name)
 
@@ -689,7 +770,10 @@ def to_number(value):
 
 def normalize_date_value(value):
     if isinstance(value, (int, float)):
-        return datetime.utcfromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        # GitHub Runner 默认为 UTC，这里显式转换为北京时间，避免日期偏差。
+        return datetime.fromtimestamp(value, ZoneInfo("Asia/Shanghai")).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     return value
 
 
@@ -796,14 +880,15 @@ def sync():
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
+    ensure_sync_properties()
     latest_sort = get_sort()
     books = get_notebooklist()
     if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
+        for index, notebook in enumerate(books):
+            sort = notebook["sort"]
             if sort <= latest_sort:
                 continue
-            book = book.get("book") or book
+            book = notebook.get("book") or notebook
             title = book.get("title") or ""
             cover = (book.get("cover") or "").replace("/s_", "/t7_")
             bookId = book.get("bookId")
@@ -815,12 +900,19 @@ def sync():
                 categories = [x["title"] for x in categories]
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
             check(bookId)
-            if has_any_property(("ISBN", "评分")):
-                isbn, rating = get_bookinfo(bookId)
+            if has_any_property(("ISBN", "评分", "字数", "译者")):
+                book_info = get_bookinfo(bookId)
             else:
-                isbn, rating = "", None
+                book_info = {}
             id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
+                title,
+                bookId,
+                cover,
+                sort,
+                author,
+                book_info,
+                categories,
+                notebook,
             )
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
