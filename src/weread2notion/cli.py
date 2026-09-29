@@ -209,6 +209,12 @@ def get_read_info(bookId):
     book = data.get("book") or {}
     progress = to_number(book.get("progress")) or 0
     reading_progress = normalize_reading_progress(progress)
+    # readingTime 才是总阅读时长；recordReadingTime 常为 0，仅作为兼容兜底。
+    reading_time = (
+        to_number(book.get("readingTime"))
+        or to_number(book.get("recordReadingTime"))
+        or 0
+    )
     finish_time = book.get("finishTime") or 0
     update_time = book.get("updateTime") or 0
     if finish_time or progress >= 100:
@@ -219,7 +225,7 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        "readingTime": reading_time,
         "readingProgress": reading_progress,
         # 微信读书返回 Unix 时间戳，写入 Notion 前统一转为东八区时间。
         "finishedDate": finish_time,
@@ -363,6 +369,9 @@ def insert_to_notion(
         minutes = readingTime % 3600 // 60
         if minutes > 0:
             format_time += f"{minutes}分"
+        # 不让 0 秒或不足 1 分钟的记录在 Notion 中显示为空。
+        if not format_time:
+            format_time = f"{int(readingTime)}秒"
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读时长"] = format_time
         raw_properties["累计阅读时长"] = format_time
