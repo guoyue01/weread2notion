@@ -881,7 +881,11 @@ def sync():
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
     ensure_sync_properties()
-    latest_sort = get_sort()
+    # 手动全量同步用于一次性补齐旧书字段，定时任务仍保持增量模式。
+    full_sync = os.getenv("FULL_SYNC", "").strip().lower() in {"1", "true", "yes"}
+    latest_sort = 0 if full_sync else get_sort()
+    if full_sync:
+        print("已启用强制全量同步，将重新同步所有微信读书记录")
     books = get_notebooklist()
     if books != None:
         for index, notebook in enumerate(books):

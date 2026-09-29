@@ -18,6 +18,10 @@ inputs:
   notion-data-source-id:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
+  full-sync:
+    description: Force a full sync instead of only syncing newer books.
+    required: false
+    default: "false"
   python-version:
     description: Python version used to run the sync.
     required: false
@@ -43,4 +47,5 @@ runs:
         NOTION_PAGE: ${{ inputs.notion-page }}
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
+        FULL_SYNC: ${{ inputs.full-sync }}
       run: weread2notion sync
