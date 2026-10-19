@@ -35,7 +35,8 @@ weread = None
 
 load_dotenv()
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
-WEREAD_SKILL_VERSION = "1.0.4"
+# 与微信读书官方 SKILL.md 的版本保持一致，网关会校验每次请求。
+WEREAD_SKILL_VERSION = "1.0.5"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
