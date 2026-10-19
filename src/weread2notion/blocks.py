@@ -22,11 +22,6 @@ def get_heading(level, content):
     }
 
 
-def get_table_of_contents():
-    """获取目录"""
-    return {"type": "table_of_contents", "table_of_contents": {"color": "default"}}
-
-
 def get_title(content):
     return {"title": [{"type": "text", "text": {"content": content}}]}
 
@@ -37,10 +32,6 @@ def get_rich_text(content):
 
 def get_url(url):
     return {"url": url}
-
-
-def get_file(url):
-    return {"files": [{"type": "external", "name": "Cover", "external": {"url": url}}]}
 
 
 def get_multi_select(names):

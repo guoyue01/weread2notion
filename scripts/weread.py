@@ -11,7 +11,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from weread2notion.cli import main
+
+def run():
+    """在补充源码路径后加载并运行兼容入口。"""
+    from weread2notion.cli import main
+
+    main()
+
 
 if __name__ == "__main__":
-    main()
+    run()

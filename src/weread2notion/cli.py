@@ -34,7 +34,6 @@ skipped_property_names = set()
 weread = None
 
 load_dotenv()
-WEREAD_URL = "https://weread.qq.com/"
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
 WEREAD_SKILL_VERSION = "1.0.4"
 NOTION_VERSION = "2026-03-11"
@@ -170,7 +169,9 @@ class WeReadGatewayClient:
         if data.get("upgrade_info"):
             raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
         if data.get("errcode", 0) != 0:
-            raise Exception(f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}")
+            raise Exception(
+                f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}"
+            )
         return data
 
 
@@ -188,14 +189,11 @@ def get_note_sort_key(item, chapter=None):
     if chapter:
         chapter_info = chapter.get(chapter_uid) or chapter.get(str(chapter_uid))
     chapter_idx = (
-        chapter_info.get("chapterIdx", 1000000)
-        if chapter_info
-        else chapter_uid
+        chapter_info.get("chapterIdx", 1000000) if chapter_info else chapter_uid
     )
     return (chapter_idx, get_range_start(item))
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookmark_list(bookId):
     """获取我的划线"""
     data = weread.request("/book/bookmarklist", bookId=bookId)
@@ -203,7 +201,6 @@ def get_bookmark_list(bookId):
     return sorted(updated, key=get_note_sort_key)
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_read_info(bookId):
     data = weread.request("/book/getprogress", bookId=bookId)
     book = data.get("book") or {}
@@ -241,6 +238,16 @@ def normalize_reading_progress(value):
     return round(min(max(value, 0), 1), 4)
 
 
+def format_reading_time(value):
+    """按小时、分钟、秒三档格式化累计阅读时长。"""
+    seconds = to_number(value) or 0
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}小时"
+    if seconds >= 60:
+        return f"{int(seconds // 60)}分钟"
+    return f"{int(seconds)}秒"
+
+
 def normalize_rating(value):
     value = value or 0
     if value > 100:
@@ -250,35 +257,50 @@ def normalize_rating(value):
     return value
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
-def get_bookinfo(bookId):
+def get_chapter_word_count(chapters):
+    """汇总各章节字数，作为书籍详情没有总字数时的兜底。"""
+    word_counts = [
+        to_number(chapter.get("wordCount")) for chapter in (chapters or {}).values()
+    ]
+    total = sum(value for value in word_counts if value is not None)
+    return total or None
+
+
+def get_bookinfo(bookId, chapters=None):
     """获取书的详情"""
     data = weread.request("/book/info", bookId=bookId)
+    # 部分书籍详情不返回 wordCount，此时累加章节字数。
+    word_count = to_number(data.get("wordCount")) or get_chapter_word_count(chapters)
     # 只返回需要写入 Notion 的书籍详情字段。
     return {
         "isbn": data.get("isbn", ""),
         "rating": normalize_rating(data.get("newRating")),
-        "wordCount": data.get("wordCount"),
+        "wordCount": word_count,
         "translator": data.get("translator", ""),
     }
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_review_list(bookId):
     """获取笔记"""
     reviews_data = []
     hasMore = 1
     synckey = 0
     while hasMore:
-        data = weread.request("/review/list/mine", bookid=bookId, synckey=synckey, count=100)
+        data = weread.request(
+            "/review/list/mine", bookid=bookId, synckey=synckey, count=100
+        )
         hasMore = data.get("hasMore", 0)
         synckey = data.get("synckey", 0)
         batch = data.get("reviews") or []
         reviews_data.extend(batch)
         if not batch:
             hasMore = 0
-    summary = list(filter(lambda x: (x.get("review") or {}).get("type") == 4, reviews_data))
-    reviews = list(filter(lambda x: (x.get("review") or {}).get("type") == 1, reviews_data))
+    summary = list(
+        filter(lambda x: (x.get("review") or {}).get("type") == 4, reviews_data)
+    )
+    reviews = list(
+        filter(lambda x: (x.get("review") or {}).get("type") == 1, reviews_data)
+    )
     reviews = list(map(lambda x: x.get("review") or {}, reviews))
     reviews = list(
         map(
@@ -293,18 +315,22 @@ def get_review_list(bookId):
     return summary, reviews
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
+def get_existing_page_ids(bookId):
+    """查询当前书籍的旧页面，待新页面完整写入后再删除。"""
     filter = build_equals_filter("BookId", bookId)
     response = query_data_source(filter=filter)
-    for result in response["results"]:
+    return [result["id"] for result in response.get("results", [])]
+
+
+def delete_pages(page_ids):
+    """删除已被完整新页面替代的旧页面。"""
+    for page_id in page_ids:
         try:
-            client.blocks.delete(block_id=result["id"])
+            client.blocks.delete(block_id=page_id)
         except Exception as e:
             print(f"删除块时出错: {e}")
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_chapter_info(bookId):
     """获取章节信息"""
     data = weread.request("/book/chapterinfo", bookId=bookId)
@@ -321,6 +347,7 @@ def insert_to_notion(
     book_info,
     categories,
     notebook_stats,
+    read_info,
 ):
     """插入到notion"""
     if not cover or not cover.startswith("http"):
@@ -340,68 +367,52 @@ def insert_to_notion(
         "想法/点评数": notebook_stats.get("reviewCount"),
         "书签数": notebook_stats.get("bookmarkCount"),
     }
-    if categories != None:
-        raw_properties["分类"] = categories
-    read_info = (
-        get_read_info(bookId=bookId)
-        if has_any_property(
-            (
-                "状态",
-                "阅读时长",
-                "阅读进度",
-                "时间",
-                "最后阅读时间",
-                "累计阅读时长",
-                "读完时间",
-                "是否已经开始阅读",
-            )
-        )
-        else None
-    )
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        # 不让 0 秒或不足 1 分钟的记录在 Notion 中显示为空。
-        if not format_time:
-            format_time = f"{int(readingTime)}秒"
+    raw_properties["分类"] = categories
+    # 子分类沿用 Notion 中已有的属性类型，支持富文本、单选或多选。
+    if notebook_stats.get("subcategories"):
+        raw_properties["子分类"] = notebook_stats["subcategories"]
+    markedStatus = read_info.get("markedStatus", 0)
+    readingTime = read_info.get("readingTime", 0)
+    readingProgress = read_info.get("readingProgress", 0)
+    format_time = format_reading_time(readingTime)
+
+    # 旧模板字段仅在真实存在时写入，避免产生无效的跳过提示。
+    if get_property_type("状态"):
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
+    if get_property_type("阅读时长"):
         raw_properties["阅读时长"] = format_time
-        raw_properties["累计阅读时长"] = format_time
+    if get_property_type("阅读进度"):
         raw_properties["阅读进度"] = readingProgress
-        raw_properties["是否已经开始阅读"] = read_info.get("isStartReading", False)
-        # 只写入有效时间，避免空时间戳在 Notion 中显示为 1970 年。
-        if read_info.get("finishedDate"):
-            # 兼容旧模板的“时间”，同时写入新增的“读完时间”。
-            if get_property_type("时间"):
-                raw_properties["时间"] = read_info["finishedDate"]
-            raw_properties["读完时间"] = read_info["finishedDate"]
-        if read_info.get("lastReadDate"):
-            raw_properties["最后阅读时间"] = read_info["lastReadDate"]
+
+    raw_properties["累计阅读时长"] = format_time
+    raw_properties["是否已经开始阅读"] = read_info.get("isStartReading", False)
+    # 只写入有效时间，避免空时间戳在 Notion 中显示为 1970 年。
+    if read_info.get("finishedDate"):
+        # 兼容旧模板的“时间”，同时写入新增的“读完时间”。
+        if get_property_type("时间"):
+            raw_properties["时间"] = read_info["finishedDate"]
+        raw_properties["读完时间"] = read_info["finishedDate"]
+    if read_info.get("lastReadDate"):
+        raw_properties["最后阅读时间"] = read_info["lastReadDate"]
 
     properties = build_notion_properties(raw_properties)
     icon = get_icon(cover)
     # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
+    response = client.pages.create(
+        parent=parent, icon=icon, cover=icon, properties=properties
+    )
     id = response["id"]
     return id
 
 
 def add_children(id, children):
     results = []
-    for i in range(0, len(children) // 100 + 1):
+    for start in range(0, len(children), 100):
         time.sleep(0.3)
         response = client.blocks.children.append(
-            block_id=id, children=children[i * 100 : (i + 1) * 100]
+            block_id=id, children=children[start : start + 100]
         )
-        results.extend(response.get("results"))
+        results.extend(response.get("results") or [])
     return results if len(results) == len(children) else None
 
 
@@ -431,6 +442,21 @@ def get_notebooklist():
             hasMore = 0
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
+
+
+def split_category_titles(categories):
+    """按横线拆分一级分类和子分类，兼容常见横线及无子分类记录。"""
+    primary_categories = []
+    subcategories = []
+    for category in categories or []:
+        title = str(category.get("title") or "").strip()
+        parts = re.split(r"\s*[-–—]+\s*", title, maxsplit=1)
+        primary = parts[0].strip()
+        if primary:
+            primary_categories.append(primary)
+        if len(parts) > 1 and parts[1].strip():
+            subcategories.append(parts[1].strip())
+    return primary_categories, subcategories
 
 
 def get_sort():
@@ -507,12 +533,14 @@ def get_children(chapter, summary, bookmark_list):
         for group in grouped_bookmarks:
             info = group["chapterInfo"]
             if info:
-                current_info = chapter_nodes.get(group["chapterUid"]) or chapter_nodes.get(
-                    str(group["chapterUid"])
-                )
+                current_info = chapter_nodes.get(
+                    group["chapterUid"]
+                ) or chapter_nodes.get(str(group["chapterUid"]))
                 if current_info is None:
                     current_info = dict(info)
-                    current_info["chapterUid"] = current_info.get("chapterUid", group["chapterUid"])
+                    current_info["chapterUid"] = current_info.get(
+                        "chapterUid", group["chapterUid"]
+                    )
                 path = get_ancestor_chain(current_info)
 
                 divergence_index = 0
@@ -538,14 +566,14 @@ def get_children(chapter, summary, bookmark_list):
                 if not markText:
                     continue
                 callout_icon = i.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
-                for j in range(0, len(markText) // 2000 + 1):
+                for start in range(0, len(markText), 2000):
                     children.append(
                         get_callout(
-                            markText[j * 2000 : (j + 1) * 2000],
+                            markText[start : start + 2000],
                             icon=callout_icon,
                         )
                     )
-                if i.get("abstract") != None and i.get("abstract") != "":
+                if i.get("abstract"):
                     quote = get_quote(i.get("abstract"))
                     grandchild[len(children) - 1] = quote
 
@@ -555,23 +583,23 @@ def get_children(chapter, summary, bookmark_list):
             markText = data.get("markText") or ""
             if not markText:
                 continue
-            for i in range(0, len(markText) // 2000 + 1):
+            for start in range(0, len(markText), 2000):
                 children.append(
                     get_callout(
-                        markText[i * 2000 : (i + 1) * 2000],
+                        markText[start : start + 2000],
                         icon=BOOKMARK_CALLOUT_ICON,
                     )
                 )
-    if summary != None and len(summary) > 0:
+    if summary:
         children.append(get_heading(1, "点评"))
         for i in summary:
             content = (i.get("review") or {}).get("content") or ""
             if not content:
                 continue
-            for j in range(0, len(content) // 2000 + 1):
+            for start in range(0, len(content), 2000):
                 children.append(
                     get_callout(
-                        content[j * 2000 : (j + 1) * 2000],
+                        content[start : start + 2000],
                         icon=NOTE_CALLOUT_ICON,
                     )
                 )
@@ -690,9 +718,7 @@ def ensure_sync_properties():
             f"Notion 属性 {', '.join(invalid)} 的类型不正确，请修改或删除后重试"
         )
 
-    missing = [
-        name for name in SYNC_PROPERTY_TYPES if not get_property_type(name)
-    ]
+    missing = [name for name in SYNC_PROPERTY_TYPES if not get_property_type(name)]
     if not missing:
         return
 
@@ -701,9 +727,7 @@ def ensure_sync_properties():
         path=f"data_sources/{data_source_id}",
         method="PATCH",
         body={
-            "properties": {
-                name: {SYNC_PROPERTY_TYPES[name]: {}} for name in missing
-            }
+            "properties": {name: {SYNC_PROPERTY_TYPES[name]: {}} for name in missing}
         },
     )
     print(f"已在 Notion 创建同步属性: {', '.join(missing)}")
@@ -712,10 +736,6 @@ def ensure_sync_properties():
 
 def get_property_type(name):
     return data_source_property_types.get(name)
-
-
-def has_any_property(names):
-    return any(name in data_source_property_types for name in names)
 
 
 def build_equals_filter(name, value):
@@ -896,49 +916,56 @@ def sync():
     if full_sync:
         print("已启用强制全量同步，将重新同步所有微信读书记录")
     books = get_notebooklist()
-    if books != None:
-        for index, notebook in enumerate(books):
-            sort = notebook["sort"]
-            if sort <= latest_sort:
-                continue
-            book = notebook.get("book") or notebook
-            title = book.get("title") or ""
-            cover = (book.get("cover") or "").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            author = book.get("author") or ""
-            if not bookId:
-                continue
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
-            if has_any_property(("ISBN", "评分", "字数", "译者")):
-                book_info = get_bookinfo(bookId)
-            else:
-                book_info = {}
-            id = insert_to_notion(
-                title,
-                bookId,
-                cover,
-                sort,
-                author,
-                book_info,
-                categories,
-                notebook,
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
-                key=lambda x: get_note_sort_key(x, chapter),
-            )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
+    for index, notebook in enumerate(books):
+        sort = notebook["sort"]
+        if sort <= latest_sort:
+            continue
+        book = notebook.get("book") or notebook
+        title = book.get("title") or ""
+        cover = (book.get("cover") or "").replace("/s_", "/t7_")
+        bookId = book.get("bookId")
+        author = book.get("author") or ""
+        if not bookId:
+            continue
+        categories, subcategories = split_category_titles(book.get("categories"))
+        print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
+
+        # 先完整获取微信读书数据，避免接口失败时提前删除旧页面。
+        chapter = get_chapter_info(bookId)
+        book_info = get_bookinfo(bookId, chapter)
+        read_info = get_read_info(bookId)
+        bookmark_list = get_bookmark_list(bookId)
+        summary, reviews = get_review_list(bookId)
+        bookmark_list.extend(reviews)
+        bookmark_list = sorted(
+            bookmark_list,
+            key=lambda x: get_note_sort_key(x, chapter),
+        )
+        children, grandchild = get_children(chapter, summary, bookmark_list)
+        old_page_ids = get_existing_page_ids(bookId)
+
+        page_id = insert_to_notion(
+            title,
+            bookId,
+            cover,
+            sort,
+            author,
+            book_info,
+            categories,
+            {**notebook, "subcategories": subcategories},
+            read_info,
+        )
+        try:
+            results = add_children(page_id, children)
+            if results is None:
+                raise Exception(f"书籍 {title} 的内容块写入不完整")
+            if grandchild:
                 add_grandchild(grandchild, results)
+        except Exception:
+            # 新页面写入失败时清理残页，并保留原页面。
+            delete_pages([page_id])
+            raise
+        delete_pages(old_page_ids)
 
 
 def main(argv=None):
